@@ -1,0 +1,1133 @@
+// Note: This file is deprecated and no longer used.
+
+//================================================================
+//                  PIAZZZA SECTION
+//================================================================
+
+var Piazzza = {};
+var Piazza = {};
+
+
+/*
+ * Catch any uncaught errors and report them to the server.
+ *
+ * This code is designed to have as few dependencies as possible; it now relies 
+ * only on jQuery. It is placed at the top of this file in order to also catch
+ * errors that occur in PA initialization.
+ *
+ * Everything is wrapped in a closure in order to avoid polluting the global
+ * namespace and to insulate the code.
+ */
+window.onerror = (function() {
+  var count = 0;
+  var MAX_COUNT = 1;
+  var API_URL = '/logic/api?method=generic.report_js_error&aid=' +
+    (new Date()).getTime().toString(36) + Math.round(Math.random() * 1679616).toString(36);
+
+  var reportError = function(params) {
+    count++;
+    if(count > MAX_COUNT) {
+      return;
+    }
+    params.location = window.location.toString();
+    if(PA && PA.user && PA.user.id) {
+      params.uid = PA.user.id;
+    }
+    $.ajax({
+      contentType: "application/json",
+      url: API_URL,
+      data: JSON.stringify({
+        'method': 'generic.report_js_error', 
+        'params': params
+      }),
+      type: 'POST',
+      dataType: 'json'
+    });
+  };
+
+  // report jQuery Ajax errors
+  $(document).ajaxError(function(event, xhr, ajaxSettings, thrownError) {
+    // ignore aborted pushes, and if the API itself fails reporting it won't do much
+    return; // don't report these for now
+    if(ajaxSettings.url.indexOf('/logic/push') === 0 || ajaxSettings.url.indexOf('/logic/api') === 0) {
+      return;
+    }
+    reportError({
+      type: 'ajax_error',
+      message: thrownError,
+      arg_dump: JSON.stringify({xhr: {
+        // don't serialize the entire XHR as that may fail (http://code.google.com/p/chromium/issues/detail?id=134082)
+        responseText: xhr.responseText.substr(0, 500), // only first 500 bytes
+        status: xhr.status
+      }, ajaxSettings: ajaxSettings})
+    });
+  });
+
+  // catch uncaught JS exceptions (the actual window.onerror)
+  return function(message, url, line) {
+    reportError({
+      type: 'js_exception',
+      message: message,
+      url: url,
+      line: line
+    });
+  };
+})();
+
+//
+// Piazzza.Data holds all data for the site, and logic to
+//
+Piazzza.Ajax = {
+  user: null,            // the main user who has logged in
+  users: {},             // hash for all users that I know
+  userQueue: [],         // all users I don't know, but need to get
+  userTimeout: null,     // when to call request for users
+  session: null,         // session id for this
+  networks: null,        // all networks user is part of
+  ajaxLogin: false,
+  autoGrowTextArea: true, //Used for mobile version due to issues with the answers and questions modifying the page awkwardly
+
+  events: new Observer(),
+  push:   new Observer(),// event handler for push messages
+  push_data: {t1: 0, t2:0, o1:"", o2:"", id:0}, // last info for object 1
+  pushError: 0,
+  pushCurrent: null,
+  staticContent: false,
+  canShowFriends: true,
+  sentError: false,
+  fb_status: "unknown",
+  apiCache: {},
+  pushstream: null,
+  pushstreamLastOpen: 0,  // when was push stream last functional
+  pushstreamLastState: 0, // what was last state of push stream
+  pushstreamTimeout: 0,   // timeout for push stream pings
+  pushstreamPingTimeout: 1000*50, // timeout for websocket pings
+  pushstreamPingHandle: 0, // handle for javascript setTimeout
+  pushstreamRefresh: 1000*60*2, // refresh feed after 2 minute of connection loss
+  eventsToLog: [],
+  // min times to log
+  userTimeThresh: { "doSelectContent":1000,
+                    "doSearch":1000,
+                    "LoadPiazzaMain":1000,
+                    "LoadWhyPiazzaWorks":1000,
+                    "doLoadDashboard":5000},
+
+  getCached: function(method, params){
+    var cacheKey = method + JSON.stringify(params);
+    return PA.apiCache[cacheKey];
+  },
+  cache: function(method, params, result){
+    var cacheKey = method + JSON.stringify(params);
+    PA.apiCache[cacheKey] = result;
+  },
+  login: function(email, pass) {
+    PA.call("user.login", {email:email, pass:pass}, null, function(){
+      PA.call_pj("user.status", {}, null, function(data, aid) {
+        PA.setUserStatus(data);
+      }, null, this);
+    });
+  },
+  logout: function() {
+    PA.call("user.logout", {}, null, function() {
+      PA.clearUserStatus();
+    }, null, this);
+  },
+  facebook_init: function() {
+    FB.getLoginStatus(function(response) {
+      if (response.status === 'connected') {
+        FB.api("/me/permissions", function(response) {
+          if (typeof response.data !== "undefined") {
+            if (response.data[0].publish_actions) {
+              Piazzza.Ajax.fb_status = "authorized";
+            } else {
+              Piazzza.Ajax.fb_status = "not_authorized";
+            }
+          }
+        });
+      } else if (response.status === "not_authorized") {
+        Piazzza.Ajax.fb_status = "not_authorized";
+      } else {
+        Piazzza.Ajax.fb_status = "not_logged_in";
+      }
+    });
+  },
+  facebook_login: function(callback, error_callback) {
+    // check if we have permissions
+    if (PA.fb_status === "authorized") {
+      callback();
+    } else {
+        FB.login(function(response) {
+          if (response.authResponse) {
+            callback();
+          } else {
+            if (typeof error_callback != "undefined" && error_callback !== null) {
+              error_callback();
+            }
+          }
+        }, {"scope":"publish_actions"});
+    }
+  },
+  initStreamPush: function() {
+    //PushStream.LOG_LEVEL = 'debug';
+    try {
+      if (PA.pushstream)
+        PA.pushstream.disconnect();
+    } catch (err) {}
+    PA.pushstream = new PushStream({
+      host: window.location.hostname,
+      port: window.location.port,
+      modes: "websocket|longpolling"
+    });
+    PA.pushtimer = (new Date()).getTime();
+    PA.pushstream.onmessage = PA.onMessage;
+    //PA.pushstream.onping = PA.onPing;
+    PA.pushstream.onstatuschange = PA.onStatuschange;
+    PA.pushstream.removeAllChannels();
+    var channel = PD.networkId;
+    if (PD.isInst)
+      channel += "_prof";
+    else
+      channel += "_stud";
+    PA.pushstream.addChannel(channel);
+    PA.pushstream.connect();
+  },
+  pushTimeout: function() {
+    PA.pushstream.disconnect();
+    PA.pushstream._connect();
+  },
+  onMessage: function(eventMessage, id, channel) {
+    PA.pushstreamLastOpen = (new Date()).getTime();
+    if (PA.pushstreamTimeout > 0) {
+      clearTimeout(PA.pushstreamTimeout);
+      PA.pushstreamTimeout = 0;
+    }
+    if (Object.prototype.toString.call(eventMessage) == '[object String]' && eventMessage.length > 0 && id >= 0) {
+      if ($.browser && $.browser.msie) // for internet explorer, escape enters
+        eventMessage = eventMessage.replace(/\n/g, '\\n');
+      eventMessage = JSON.parse(eventMessage);
+    }
+    if (channel == "ctrl_c") {
+      PA.pushTimeout();
+      return;
+    }
+    if (channel == "ping" || id == -1) {
+      return;
+    }
+    PA.push.fire("push", eventMessage);
+  },
+  sendPing: function() {
+    if (PA.pushstream && PA.pushstream.wrapper && PA.pushstream.wrapper.type == "WebSocket") {
+      if (PA.pushstream.readyState == PushStream.OPEN) {
+        PA.pushstream.sendMessage("pong");
+      }
+      if (PA.pushstreamLastOpen > 0) {
+        // check how long we were down
+        var now = (new Date()).getTime();
+        var down = now - PA.pushstreamLastOpen;
+        //console.log("going up at: " + now + "; down: " + down);
+        if (down > PA.pushstreamRefresh) { // more than 2 minutes down, refresh
+          PA.pushTimeout();
+        }
+      }
+      PA.pushstreamPingHandle = setTimeout(PA.sendPing, PA.pushstreamPingTimeout);
+    }
+  },
+  onStatuschange: function(state) {
+    //console.log("State: " + state);
+    if (state == PushStream.OPEN) {
+      // create timeout for pings
+      if (PA.pushstreamTimeout > 0)
+        clearTimeout(PA.pushstreamTimeout);
+      if (PA.pushstream.wrapper.type != "LongPolling") {
+        PA.pushstreamTimeout = setTimeout(PA.pushTimeout, 10000); // set 10 second timeout
+        if (PA.pushstreamPingHandle > 0)
+          clearTimeout(PA.pushstreamPingHandle);
+        PA.pushstreamPingHandle = setTimeout(PA.sendPing, PA.pushstreamPingTimeout);
+      } else {
+        // no ping needed for longpolling
+        if (PA.pushstreamPingHandle > 0)
+          clearTimeout(PA.pushstreamPingHandle);
+      }
+      if (PA.pushstreamLastOpen > 0) {
+        // check how long we were down
+        var now = (new Date()).getTime();
+        var down = now - PA.pushstreamLastOpen;
+        //console.log("going up at: " + now + "; down: " + down);
+        if (down > PA.pushstreamRefresh) { // more than 2 minutes down, refresh
+          PA.reloadState();
+        }
+        PA.pushstreamLastOpen = now;
+      }
+    }
+    PA.pushstreamLastState = state;
+  },
+  reloadState: function() {
+    setTimeout(function(){
+      PD.loadFeed(false, false);
+      if (PD.content) {
+        PA.call_pj("content.get", {cid:PD.content.id, nid:PD.networkId}, 1, function(content, aid) {
+          PD.content = content;
+          PD.populateTextArea('#question', '#question-editor', PD.content, PD.content.history[0].uid == PA.user.id);
+          PD.toggleFeedbackTags('#question', PD.content);
+        });
+      }
+    }, 200);
+  },
+
+  // open push connection and deal with the results
+  initPush: function() {
+    return;
+    if (PA.staticContent) return;
+    if (PA.user.email == 'tutorial') return;
+    var url = '/logic/push?id=' + PA.push.id + '&t1=' + PA.push_data.t1 + '&t2=' + PA.push_data.t2 +
+      '&o1=' + PA.push_data.o1 + '&o2=' + PA.push_data.o2 + '&t=' + (new Date()).getTime();
+    if (PA.cookie) url += "&cookie=" + PA.cookie;
+    var id = PA.push_data.id;
+    if (PA.pushCurrent) {
+      PA.pushAbort = true;
+      PA.pushCurrent.abort(); // abort previous request
+      PA.pushAbort = false;
+    }
+    PA.pushCurrent = $.ajax({
+      url: url,
+      type: 'GET',
+      dataType: 'json',
+      timeout: 15 * 60 * 1000, // 15 minute timeout
+      success: function(messages) {
+        if (PA.pushAbort) return;
+        PA.pushCurrent = false;
+        if (PA.push_data.id == id)
+          setTimeout(function(){ if (PA.push_data.id == id) PA.initPush();}, 1000);
+        PA.pushError = 0;
+        if (messages && messages instanceof Array) {
+          var minT = 0;
+          messages.forEach(function(message){
+            if (message.type == "keep-alive") {
+              minT = message.t;
+            }
+            if (message.reload) { // need to reload class
+              setTimeout(function(){
+                PD.loadFeed(false, false);
+                if (PD.content) {
+                  PA.call_pj("content.get", {cid:PD.content.id, nid:PD.networkId}, 1, function(content, aid) {
+                    PD.content = content;
+                    PD.populateTextArea('#question', '#question-editor', PD.content, PD.content.history[0].uid == PA.user.id);
+                    PD.toggleFeedbackTags('#question', PD.content);
+                    PA.push_data.t2 = content.t;
+                    PA.push_data.o2 = content.id;
+                    PA.push_data.id++;
+                    var cur_id = PA.push_data.id;
+                    // init push
+                    setTimeout(function(){
+                      // only init push if user is still viewing this question
+                      if (cur_id == PA.push_data.id) {
+                        PA.initPush();
+                      }
+                    }, 5000); // wait 5 seconds
+                  });
+                }
+              }, 200);
+            }
+            if (message.msg && message.oid && message.t) {
+              if (message.oid == PA.push_data.o1 || message.oid == PA.push_data.o2) {
+                message.msg.oid = message.oid;
+                PA.push.fire("push", message.msg);
+                if (message.oid == PA.push_data.o1 && message.t > PA.push_data.t1)
+                  PA.push_data.t1 = message.t;
+                if (message.oid == PA.push_data.o2 && message.t > PA.push_data.t2)
+                  PA.push_data.t2 = message.t;
+                if (minT == 0 || minT > message.t)
+                  minT = message.t;
+              }
+            }
+          });
+          if (PA.push_data.t1 < minT) PA.push_data.t1 = minT;
+          if (PA.push_data.t2 < minT) PA.push_data.t2 = minT;
+        }
+      },
+      error: function(req, status, err) {
+        PA.pushCurrent = false;
+        PA.pushError++;
+        if (PA.pushError < 3) {
+          if (PA.push_data.id == id)
+            setTimeout(function(){ if (PA.push_data.id == id) PA.initPush();}, 5000);
+        } else {
+          PA.pushError = 0;
+        }
+      }
+    });
+  },
+  init: function() {
+    PA.push.id = (new Date()).getTime().toString(36) + Math.round(Math.random() * 1679616).toString(36);
+    if (PA.ajaxLogin) {
+      if (typeof(PD) != 'undefined' && PD.loading) PD.loadProgress(3);
+      //PA.call_pj("user.status", {}, null, PA.setUserStatus, null, this);
+      PA.call_pj("user.status", {}, null, function(data, aid) {
+        PA.setUserStatus(data);
+      }, function(err) {
+        if (err == "Email verification needed") {
+          //alert("You need to verify your email address in order to access this class");
+          if (PA.pushCurrent) {
+            PA.pushCurrent.abort();
+            PA.pushAbort = false;
+            PA.pushCurrent = false;
+          }
+          window.location = "/email_auth";
+          return;
+        }
+      }, this);
+    }
+  },
+  // ==================================================================
+  //
+  // Helper functions and asynchronous response handlers
+  //
+  // error handlers
+  regularError: function(err) {
+    if (err.indexOf("Session needed") >= 0 || err.indexOf("Not logged in") >= 0) {
+      // try to make new session
+      //this.call("user.get_session", {}, null, this.setUserStatus, function(error){
+        // session cannot be obtained. Redirect to login page!
+        // location.href = "/login.html";
+      //if (err.indexOf("Session needed") >= 0)
+      //  PA.init();
+      //else
+        PA.events.fire("no_user");
+      //}, this);
+    } else {
+      PA.events.fire("error", err);
+      //Piazzza.Common.error(err);
+    }
+  },
+  // this happens when site cannot contact our server
+  badError: function() {
+    //PA.events.fire("error", );
+    //alert("Cannot communicate with main Piazza server. Check your internet connection, or try again later.");
+    if (typeof(PD) != 'undefined') {
+      PD.detectNetworkTimeout();
+    }
+
+    if (typeof(console) != 'undefined') console.log("Cannot communicate with main Piazza server. Check your internet connection, or try again later.");
+  },
+  checkSession: function(err, method) {
+    if (method === "user.check_session") return;
+
+    /* When we get session-related errors, check that this client hasn't been logged out in another window. */
+    if (err.indexOf("No permission") >= 0 || err.indexOf("Please authenticate") >= 0 || err.indexOf("Action not allowed for unknown users") >= 0) {
+      PA.call_pj("user.check_session", {}, 1, function(data) {
+        if (data.id !== PA.user.id) { /* Server and client do not match user IDs! */
+          PD.triggerLogoutWarning();
+        }
+      }, function(err) {
+        if (err.indexOf("Please authenticate") >= 0) { /* No user logged in, trigger warning. */
+          PD.triggerLogoutWarning();
+        }
+      });
+    }
+  },
+
+  getUserName: function(id, anon, my_private_post, incognito_text) {
+    var html = '';
+    html += '<span anon="' + anon + '" class="user_name user_name_' + id ;
+    if (id && (!anon || anon == "no" || id != PA.user.id || (typeof(PD) != 'undefined' && PD.isInst) ||
+        (typeof(PL) != 'undefined' && PL.isInst))) {
+      if (Piazzza.Ajax.users[id]) {
+        if (typeof(PD) != 'undefined' && anon  == "stud"){
+          html += ' user_name_anon anon_box_color" notutorial="anonymous to classmates">' + Piazzza.Ajax.users[id].name + '</span><span class="smallText">&nbsp;(anon. to classmates)</span>';
+        } else {
+          if (PA.canShowFriends) {
+            html += '"><a class="view-profile-link" href="#" onClick="App.piazzaView.goToStudentProfile(&quot;' + id + '&quot;, &quot;click-studentProfileFromQuestion&quot;);return false;" target="_self">' + Piazzza.Ajax.users[id].name + '</a></span>';
+          } else {
+            html += '">' + Piazzza.Ajax.users[id].name + '</span>';
+          }
+        }
+      } else {
+        html += ' user_loading">Loading...</span>';
+        Piazzza.Ajax.loadUser(id);
+      }
+    } else if (my_private_post && anon == "stud") {
+      if (incognito_text) {
+        html += ' user_name_anon anon_box_color" notutorial="invisible to classmates">you</span>';
+      } else {
+        html += ' user_name_anon anon_box_color" notutorial="invisible to classmates">' + PA.user.name + '</span>';
+      }
+    } else {
+      html += ' " notutorial="anonymous">Anonymous </span>';
+    }
+    return html;
+  },
+  getUserPic: function(id, no_click, no_resize, no_border) {
+    var resize = (no_resize) ? '' : 'onload="onImageLoad(event);"';
+    var border = (no_border) ? 'no_border' : 'white_border';
+
+    var html = '<div class="user_pic user_pic_' + id ;
+    if (id && id != "0")
+      if (PA.users[id]) {
+        var imagePath = 'https://dvngeac8rg9mb.cloudfront.net/images/dashboard/common/default_user.png';
+        if (PA.users[id].email == 'admin') imagePath = 'https://dvngeac8rg9mb.cloudfront.net/images/dashboard/common/nerd_small.png';
+        if (PA.users[id].photo)
+          imagePath = 'https://cdn-uploads.piazza.com/photos/' + id + '/' + PA.users[id].photo;
+        else if (PA.users[id].facebook_id)
+          imagePath = 'https://graph.facebook.com/' + PA.users[id].facebook_id + '/picture?type=square';        
+        if (PA.user && id == PA.user.id && imagePath == 'https://dvngeac8rg9mb.cloudfront.net/images/dashboard/common/default_user.png' &&
+          !PA.user.is_public && (no_click==undefined || !no_click) ) {
+          imagePath = '';
+          html += '"><a href="#" class="upload_photo" onclick="showImageUpload();return false;">' +
+            '<div class="' + border + '"><img title="' + Piazzza.Ajax.users[id].name + '" src="https://dvngeac8rg9mb.cloudfront.net/images/dashboard/common/add-photo-pic.png" ' + resize + ' /></div></a>';
+        }
+        else
+          html += '"><div class="' + border + '"><img title="' + Piazzza.Ajax.users[id].name.replace(/"/g, '&quot;') + '" src="' + imagePath + '" ' + resize + ' /></div>';
+      } else {
+        html += ' user_loading">&nbsp;';
+        PA.loadUser(id);
+      }
+    else {
+      html += '"><div class="' + border + '"><img title="Anonymous" src="https://dvngeac8rg9mb.cloudfront.net/images/dashboard/common/default_anonymous.png" ' + resize + ' /></div>';
+    }
+    html += "</div>";
+    return html;
+  },
+  loadUser: function(id) {
+    if (!Piazzza.Ajax.userQueue.exist(id))
+      Piazzza.Ajax.userQueue.push(id);
+    if (!Piazzza.Ajax.userTimeout)
+      Piazzza.Ajax.userTimeout = setTimeout('Piazzza.Ajax.getQueuedUsers()', 100);
+  },
+  setUserPic: function(usr) {
+    $('.user_name_' + usr.id).each(function(){
+      if (PA.canShowFriends) {
+        $(this).html('<a class="view-profile-link" href="#" onClick="App.piazzaView.goToStudentProfile(&quot;' + usr.id + '&quot;, &quot;click-studentProfileFromQuestion&quot;);return false;" target="_self">' + usr.name + '</a>');
+      } else {
+        $(this).html(usr.name);
+      }
+      if ($(this).attr("anon") == "stud") {
+        $(this).html(usr.name + " <span class=\"smallText\">(anon. to classmates)</span>");
+        //$(this).addClass("user_name_anon");
+      }
+    });
+    var imagePath = 'https://dvngeac8rg9mb.cloudfront.net/images/dashboard/common/default_user.png';
+    if (usr.email == 'admin') imagePath = 'https://dvngeac8rg9mb.cloudfront.net/images/dashboard/common/nerd_small.png';
+    if (usr.photo)
+      imagePath = 'https://cdn-uploads.piazza.com/photos/' + usr.id + '/' + usr.photo;
+    else if (usr.facebook_id)
+      imagePath = 'https://graph.facebook.com/' + usr.facebook_id + '/picture?type=square';
+    $('.user_pic_' + usr.id).html('<div class="white_border"><img title="'+usr.name.replace(/"/g, '&quot;')+'" src="' + imagePath + '" onload="onImageLoad(event);"/></div>');
+    if (usr.id == PA.user.id)
+      PA.user.photo = usr.photo;
+  },
+  getQueuedUsers: function() {
+    var nid = 0;
+    if (Piazzza.Dashboard && Piazzza.Dashboard.selectedNetwork)
+      nid = Piazzza.Dashboard.selectedNetwork.id;
+    var data = {ids:Piazzza.Ajax.userQueue, nid:nid};
+    if (typeof(PD) != "undefined" && PD.anonymize) { data["anonymize"] = "true"; }
+    Piazzza.Ajax.call_pj("network.get_users", data, 1, function(data){
+      data.forEach(function(usr){
+        PA.users[usr.id] = usr;
+        PA.setUserPic(usr);
+      });
+      $('div.tipsy').remove(); // remove old tipsy messages
+      //if (typeof(PD) != 'undefined') $('.user_name_anon').tipsy({gravity: 'n', html: true});
+    });
+
+    Piazzza.Ajax.userQueue = [];
+    Piazzza.Ajax.userTimeout = null;
+  },
+  getUsersInfo: function(ids, nid, block, callback) {
+    if (!ids) return;
+    var ret = {};
+    var queue = [];
+    for (var i = 0; i < ids.length; i++) {
+      if (PA.users[ids[i]])
+        ret[ids[i]] = PA.users[ids[i]];
+      else
+        queue.push(ids[i]);
+    }
+    if (queue.length == 0)
+      callback(ret);
+    else {
+      var data = {ids:queue, nid:nid};
+      if (typeof(PD) != "undefined" && PD.anonymize) { data["anonymize"] = "true"; }
+      Piazzza.Ajax.call_pj("network.get_users", data, 1, function(data){
+        data.forEach(function(usr) {
+          ret[usr.id] = usr;
+          PA.users[usr.id] = usr;
+        });
+        callback(ret);
+      });
+    }
+  },
+  // get network with the given nid out of PA.user.networks
+  getNetwork: function(nid) {
+    if(PA.user === null) {
+      return undefined;
+    }
+    return PA.user.networks.findAll(function(network) {
+      return network.id === nid;
+    })[0];
+  },
+  // keeping track of messages seen by network
+  markSeenNetwork: function(network, msg) {
+    if(!network.config.seen_message) {
+      network.config.seen_message = [];
+    }
+    // no need to mark as seen if it's already seen
+    if(PA.isSeenNetwork(network, msg)) {
+      return;
+    }
+    network.config.seen_message.push(msg);
+    PA.call_pj("network.mark_seen", {
+      nid: network.id,
+      message: msg
+    }, 1);
+  },
+  isSeenNetwork: function(network, msg) {
+    return network.config && (network.config.seen_message instanceof Array) && network.config.seen_message.exist(msg);
+  },
+  markSeenUnseen: function(message, unmark) {
+    PA.call_pj("user." + (unmark ? "un" : "") + "mark_seen", {msg:message}, 1);
+    if (!unmark) {
+      if (!PA.user.config.seen_message) PA.user.config.seen_message = [];
+      PA.user.config.seen_message.push(message);
+    }
+  },
+  isSeenUser: function(msg) {
+    return PA.user && PA.user.config && PA.user.config.seen_message && PA.user.config.seen_message.exist(msg);
+  },
+  isUserVerified: function() {
+    return !(PA.user && PA.user.config && PA.user.config.needs_email_auth && PA.user.config.needs_email_auth > 0);
+  },
+
+  // =================================================
+  // called for user.login and user.status functions
+  //
+  setUserStatus: function(data) {
+    PA.user = data;
+    PA.session = data.session;
+    PA.networks = data.networks;
+    PA.captchaNeeded = false;
+    PA.user.is_public = false;
+    if (!PA.user.config)
+      PA.user.config = {};
+    if (PA.user.id.match("public")) {
+      PA.user.is_public = true;
+      PA.canShowFriends = false;
+    }
+    if (PA.user.is_public) {
+      $('.no-public').hide();
+      $('.for-no-public').show();
+      PA.captchaNeeded = true;
+    }
+    // get all admin user info
+    PA.networks.forEach(function(net){
+      if (net.profs) {
+        net.profs_hash = {};
+        net.profs.forEach(function(usr){
+          PA.users[usr.id] = usr;
+          net.profs_hash[usr.id] = 1;
+        });
+      }
+    });
+    var adm = 0;
+    for (var s in PA.user.can_admin) adm++;
+    if (adm > 0)
+      PA.user.is_admin = true;
+    else
+      PA.user.is_admin = false;
+    /*
+    if (typeof(PD) != 'undefined') {
+      PD.show_tutorial = false;
+      if (PA.user.email != 'tutorial' && (!PA.user.config.seen_message || !PA.user.config.seen_message.exist('tutorial'))) {
+        PD.show_tutorial = true;
+        PA.load("/dashboard/tutorial", $('#tutorial'), function(data){
+          $('#tutorial').html(data);
+          if (PD.selectedNetwork) {
+            TUT.init();
+            if (PD.networkId != "piazzza")
+              TUT.showVideo();
+          }
+        });
+      }
+    }
+    */
+
+    if (PA.user.config == null)
+      PA.user.config = {};
+    if (PA.user.config.logins == null)
+      PA.user.config.logins = 0;
+
+    PA.events.fire("user_login", data);
+
+    //setTimeout(function(){PA.initStreamPush();}, 5000);
+    if (data.facebook) data.facebook_id = data.facebook.id;
+    PA.users[data.id] = data;
+    if (data.config && data.config.endorser)
+      data.endorser = data.config.endorser;
+    $('.my-pic').html(PA.getUserPic(data.id));
+    $('.my-pic-noclick').html(PA.getUserPic(data.id, true));
+    $('.my-name').html(data.name);
+    $('.my-facebook-name').html(data.facebook.name);
+    // initiate push handler in 2 seconds to avoid browser loading image
+  },
+  clearUserStatus: function() {
+    PA.user = null;
+    PA.session = null;
+    PA.networks = null;
+    PA.captchaNeeded = false;
+    // TODO: clearout profile pic
+    PA.events.fire("user_logout");
+  },
+  isUserNewInstructor: function() {
+    if (PA.user && PA.user.is_admin && PA.user.activated) {
+      var now = +new Date();
+      var agoMsecs = now - PA.user.activated;
+      var agoHours = agoMsecs/1000/3600;
+      if (agoHours < 48) {
+        return true;
+      }
+      return false;
+    }
+  },
+
+  load: function(path, blockObject, callback, error, scope) {
+    if (PA.user && PA.user.config && PA.user.config.no_spinner)
+      blockObject = 1;
+    if (blockObject) {
+      if (blockObject != 1) blockObject.block();
+    } else
+      $.blockUI();
+    if (path.indexOf('?') < 0)
+      path += "?t=" + (new Date()).getTime();
+    else
+      path += "&t=" + (new Date()).getTime();
+    $.ajax({
+      url: path,
+      type: 'GET',
+      dataType: 'html',
+      success: function(data) {
+        if (blockObject) {
+          if (blockObject != 1) blockObject.unblock();
+        } else
+          $.unblockUI();
+        if (data && callback)
+          callback.call(scope, data);
+      },
+      error: function(req, status, err) {
+        if (blockObject)
+          if (blockObject != 1) blockObject.unblock();
+        else
+          $.unblockUI();
+        if (error)
+          error.call(scope, err);
+      }
+    });
+  },
+
+  call_pj: function(method, params, blockObject, callback, error, scope) {
+    //if (typeof(console) != 'undefined') console.log("PA.call_pj method:" + method + ", params:" + JSON.stringify(params));
+    var cached = PA.getCached(method, params);
+    if(callback && cached && !cached.error && cached.result){  //don't return cached errors
+       callback.call(scope, cached.result, cached.aid);
+       return;
+    }
+    if (PA.cookie)
+      params.cookie = PA.cookie;
+    var data;
+
+    if (PA.eventsToLog.length > 0) {
+      data = JSON.stringify({method:method, params:params, logdata:{logevents:PA.eventsToLog}});
+      PA.eventsToLog = [];
+    }
+    else
+      data = JSON.stringify({method:method, params:params});
+    var csrfToken = window.CSRF_TOKEN || "";
+    data = data.replace(/\\u000a/gi, "\\n");
+    data = data.replace(/\?/gi, "%3F");
+    if (PA.user && PA.user.config && PA.user.config.no_spinner)
+      blockObject = 1;
+    if (blockObject) {
+      if (blockObject != 1) blockObject.block();
+    } else
+      $.blockUI();
+    if (PA.staticContent && method != "network.search" && method != "network.filter_feed") {
+      var path = "/static/" + PA.staticContent + "/" + method;
+      if (params.cid)
+        path += "/" + params.cid;
+      path += "?t=" + (new Date()).getTime();
+      $.ajax({
+        contentType: "application/json",
+        url: path,
+        type: 'GET',
+        beforeSend: function(xhr){
+          xhr.setRequestHeader('CSRF-Token', csrfToken);
+        },
+        success: function(data) {
+          if (blockObject) {
+            if (blockObject != 1) blockObject.unblock();
+          } else
+            $.unblockUI();
+          if (data.result && callback)
+            callback.call(scope, data.result, "static");
+        },
+        error: function(req, status, error) {
+          if (blockObject && blockObject != 1)
+            if (blockObject != 1) blockObject.unblock();
+          else
+            $.unblockUI();
+          //Piazzza.Ajax.badError(error);
+        }
+      });
+    } else {
+      $.ajax({
+        contentType: "application/json",
+        url: '/logic/api?method=' + method + '&aid=' + (new Date()).getTime().toString(36) + Math.round(Math.random() * 1679616).toString(36),
+        data: data,
+        beforeSend: function(xhr){
+          xhr.setRequestHeader('CSRF-Token', csrfToken);
+        },
+        success: function(data) {
+          if (blockObject) {
+            if (blockObject != 1) blockObject.unblock();
+          } else
+            $.unblockUI();
+          if (data.result && callback)
+            callback.call(scope, data.result, data.aid);
+          if (data.error) {
+            if (error)
+              error.call(scope, data.error);
+            else
+              PA.regularError(data.error);
+
+            PA.checkSession(data.error, method);
+          } else {
+            if (typeof(PD) != 'undefined') {
+              if (PD.networkTimeout === true) {
+                PD.resolveNetworkTimeout();
+              }
+
+              if (PD.logoutWarning === true) {
+
+              }
+            }
+          }
+        },
+        error: function(req, status, error) {
+          // try again first
+          setTimeout(function(){
+            $.ajax({
+              contentType: "application/json",
+              url: '/logic/api?method=' + method + '&aid=' + (new Date()).getTime().toString(36) + Math.round(Math.random() * 1679616).toString(36),
+              data: data,
+              beforeSend: function(xhr){
+                xhr.setRequestHeader('CSRF-Token', csrfToken);
+              },
+              success: function(data) {
+                if (blockObject) {
+                  if (blockObject != 1) blockObject.unblock();
+                } else
+                  $.unblockUI();
+                if (data.result && callback)
+                  callback.call(scope, data.result, data.aid);
+                if (data.error) {
+                  if (error)
+                    error.call(scope, data.error);
+                  else
+                    PA.regularError(data.error);
+                }
+              },
+              error: function(req, status, error) {
+                if (blockObject)
+                  if (blockObject != 1) blockObject.unblock();
+                else
+                  $.unblockUI();
+                PA.badError(error);
+              }
+            });
+          }, 3000);
+        }
+      });
+    }
+  },
+
+  call: function(method, params, blockObject, callback, error, scope) {
+    //XXXXXXXXXXXX
+    if (PA.cookie)
+      params.cookie = PA.cookie;
+    var data = JSON.stringify({method:method, params:params});
+    data = data.replace(/\\u000a/gi, "\\n");
+    var csrfToken = window.CSRF_TOKEN || "";
+    if (typeof(PD) != 'undefined' && PD.loading)
+      blockObject = 1; // do not show any block objects while loading
+    if (PA.user && PA.user.config && PA.user.config.no_spinner)
+      blockObject = 1;
+    if (blockObject) {
+      if (blockObject != 1) blockObject.block();
+    } else
+      $.blockUI();
+    if (PA.staticContent && method != "network.search") {
+      var path = "/static/" + PA.staticContent + "/" + method;
+      if (params.cid)
+        path += "/" + params.cid
+      path += "?t=" + (new Date()).getTime();
+      $.ajax({
+        contentType: "application/json",
+        url: path,
+        type: 'GET',
+        beforeSend: function(xhr){
+          xhr.setRequestHeader('CSRF-Token', csrfToken);
+        },
+        success: function(data) {
+          if (blockObject) {
+            if (blockObject != 1) blockObject.unblock();
+          } else
+            $.unblockUI();
+          if (data.result && callback)
+            callback.call(scope, data.result, "static");
+        },
+        error: function(req, status, error) {
+          if (blockObject && blockObject != 1)
+            if (blockObject != 1) blockObject.unblock();
+          else
+            $.unblockUI();
+          //Piazzza.Ajax.badError(error);
+        }
+      });
+    } else {
+      $.ajax({
+        contentType: "application/json",
+        data: data,
+        beforeSend: function(xhr){
+          xhr.setRequestHeader('CSRF-Token', csrfToken);
+        },
+        success: function(data) {
+          if (blockObject) {
+            if (blockObject != 1) blockObject.unblock();
+          } else
+            $.unblockUI();
+          if (data.result && callback)
+            callback.call(scope, data.result, data.aid);
+          if (data.need_refresh && data.need_refresh.length > 0) {
+            // session was stale, we need to refresh the state
+            if (typeof(PD) != 'undefined') {
+              if (PA.session != data.need_refresh) {
+                PA.session = data.need_refresh;
+              }
+            }
+          }
+          if (data.error) {
+            if (error)
+              error.call(scope, data.error);
+            else
+              Piazzza.Ajax.regularError(data.error);
+          }
+        },
+        error: function(req, status, error) {
+          if (blockObject && blockObject != 1)
+            blockObject.unblock();
+          else
+            $.unblockUI();
+          //Piazzza.Ajax.badError(error);
+        }
+      });
+    }
+  },
+ //tracks an event, writes it to db
+  trackEvent2: function(async, event, loc, data){
+    /*
+    //alert("tracked - "+event);
+    var url = "/tracking/trackEvent?event=" + event;
+    url += "&loc="+loc.replace(".html","/");
+    url += "&full_url=" + window.location.pathname + window.location.hash.replace("#","(hash)");
+    if (data) {
+      if (data instanceof Array) {
+        url += "&data=" + data.join("|");
+      } else {
+        for (key in data) {
+          if (data[key] instanceof Array) {
+            url += "&" + key + "=" + data[key].join("|");
+          } else {
+            url += "&" + key + "=" + data[key];
+          }
+        }
+      }
+    }
+    url += "&t=" + (new Date()).getTime();
+    $.ajax({
+      type: "GET",
+      url: url,
+      async: async
+    });*/
+  },
+
+  // analytics tracker
+  trackEvent: function(async, evnt, loc, data) {
+    /*var url = "/analytics/trackEvent?event=" + evnt;
+    url += "&loc="+loc.replace(".html","/");
+    url += "&full_url=" + window.location.pathname + window.location.hash.replace("#","(hash)");
+    if (data) {
+      if (data instanceof Array) {
+        url += "&data=" + data.join("|");
+      } else {
+        for (var key in data) {
+          if (data[key] instanceof Array) {
+            url += "&" + key + "=" + data[key].join("|");
+          } else {
+            url += "&" + key + "=" + data[key];
+          }
+        }
+      }
+    }
+    url += "&t=" + (new Date()).getTime();
+    $.ajax({
+      type: "GET",
+      url: url,
+      async: async
+    });*/
+  },
+  log_action: function(action) {
+    if (PA.user && PA.user.id) {
+      PA.call("user.log_action", {uid: PA.user.id, action : action}, 1);
+    }
+  },
+
+  log_call_pj: function(method, params) {
+    if (!params.nid) {
+      if (typeof(PD) != "undefined" && PD != null) {
+        params.nid = PD.networkId;
+      } else {
+        params.nid = "";
+      }
+    }
+    if (PA.user)
+      params.uid = PA.user.id;
+    var data = JSON.stringify({method:method, params:params});
+    data = data.replace(/\\u000a/gi, "\\n");
+    data = data.replace(/\?/gi, "%3F");
+    $.ajax({
+        contentType: "application/json",
+        url: '/logic/api?method=' + method + '&aid=' + (new Date()).getTime().toString(36) + Math.round(Math.random() * 1679616).toString(36),
+        data: data,
+        type: 'POST'
+      });
+  },
+  logEvent: function(e, nid) {
+    PA.log_call_pj("log.event", {"event": e, "nid" : nid});
+  },
+  addStat: function(stat, count, nid) {
+    var params = {
+      "nid": nid,
+      "stat": stat,
+      "count": count
+    };
+    PA.log_call_pj("log.add", params);
+  },
+  addStatIfNew: function(stat1, count1, stat2, count2, stat3, count3, nid, email) {
+    var stats = {};
+    stats[stat1] = count1;
+    stats[stat2] = count2;
+    stats[stat3] = count3;
+    
+    var params = {
+      "nid": nid,
+      "stats": stats,
+      "email": email
+    };
+    PA.log_call_pj("log.add_if_new", params);
+  },
+  logEventNew: function(subtype, params, aid) {
+    params.subtype = subtype;
+    if (aid)
+      params.ad_id = aid;
+    if (PA.user)
+      params.user_id = PA.user.id;
+
+    if (typeof(PD) == 'undefined') {
+      PA.call_pj("log.logData", {"logevents":[params]}, 1);
+    }
+    else
+    {
+      params.network_id = PD.networkId;
+      if (PD.contentId)
+        params.content_id = PD.contentId;
+      if (PD.selectedNetwork)
+        params.school_id = PD.selectedNetwork.school_id;
+      PA.eventsToLog.push(params);
+    }
+  },
+  logUserTime: function(stat, starttime, aid) {
+    var timer = new Date().getTime() - starttime;
+    var thr = PA.userTimeThresh[stat];
+    if (typeof(thr) == 'undefined')
+      thr = 1001;
+    if (timer < thr)
+      return;
+    PA.logEventNew(stat, {"int1":timer}, aid);
+  }
+};
+
+
+var PA = Piazzza.Ajax;
+
+$(document).ready(function() {
+  $.ajaxSetup({
+      url: '/main/api',
+      type: 'POST',
+      dataType: 'json',
+      timeout: 15 * 60 * 1000 // 15 minute timeout
+  });
+  if (typeof(PD) != 'undefined') PD.loadProgress(2);
+  // avoid spinning browser
+  setTimeout(function(){ PA.init();}, 50);
+});
+
+$.blockUI.defaults.overlayCSS["z-index"] = "1000000";
+$.blockUI.defaults.css["z-index"] = "1000001";
+$.blockUI.defaults.css.border = 'none';
+$.blockUI.defaults.css.cursor = 'default';
+$.blockUI.defaults.overlayCSS.cursor = 'default';
+//$.blockUI.defaults.overlayCSS.opacity = 0.3;
+//$.blockUI.defaults.css.backgroundColor = 'transparent';
+//$.blockUI.defaults.message = '<img src="https://dvngeac8rg9mb.cloudfront.net/images/dashboard/common/ajax-loader.gif"/>';
+$.blockUI.defaults.message = '';
+
+//
+// Static callAjax method
+//
+function callAjax(method, params, callback, error) {
+  var data = JSON.stringify({method:method, params:params});
+  data = data.replace(/\\u000a/gi, "\\n");
+  var csrfToken = window.CSRF_TOKEN || "";
+  $.ajax({
+    data: data,
+    beforeSend: function(xhr){
+      xhr.setRequestHeader('CSRF-Token', csrfToken);
+    },
+    success: function(data) {
+      if (data.result != null)
+        callback(data.result);
+      if (data.error != null) {
+        if (error)
+          error(data.error);
+        else
+          Piazzza.Ajax.regularError(data.error);
+      }
+    },
+    error: function(data) {
+      Piazzza.Ajax.badError(data.error);
+    }
+  });
+}
+
+
+window.CSRF_TOKEN = $('meta[name=csrf_token]').attr('content');
+
+if(!window.CSRF_TOKEN){
+  var script = document.createElement('script');
+  script.src = "/main/csrf_token";
+  script.onload = function(){
+  };
+  document.head.appendChild(script);
+}
+
+
+
