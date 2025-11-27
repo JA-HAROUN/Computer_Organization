@@ -1,44 +1,48 @@
-/*
- Name:		Sketch_test.ino
- Created:	5/15/2022 7:35:32 PM
- Author:	Ahmed
-*/
-
-const int buttonPin = 9;
-const int ledPin = LED_BUILTIN;
-
 int x;
-bool buttonState = false;
-bool lastButtonState = false;
-bool ledState = false;
-
-// the setup function runs once when you press reset or power the board
+int buttonPin = 2;
+bool previous = HIGH;
+bool ledState = LOW;
 void setup() {
-	x = 20;
-
-	Serial.begin(115200);
-
-	pinMode(ledPin, OUTPUT);
-	pinMode(buttonPin, INPUT);
-	
-	lastButtonState = digitalRead(buttonPin);
-	buttonState = lastButtonState;
-	ledState = buttonState;
-	digitalWrite(ledPin, buttonState);
+    Serial.begin(115200);
+    pinMode(buttonPin, INPUT_PULLUP);
+    pinMode(LED_BUILTIN, OUTPUT);
+    digitalWrite(LED_BUILTIN, ledState);
+    x = 20;
 }
 
-// the loop function runs over and over again until power down or reset
+boolean debounce(int pin) {
+    boolean state;
+    boolean previousState;
+    previousState = digitalRead(pin);
+    for (int i = 0; i < 10; i++) {
+        delay(10);
+        state = digitalRead(pin);
+        if (state != previousState) {
+            i = 0;
+            previousState = state;
+        }
+    }
+    return state;
+}
+
 void loop() {
-	buttonState = digitalRead(buttonPin);
+    ledState = digitalRead(LED_BUILTIN);
 
-	if (buttonState != lastButtonState) {
-		ledState = !ledState;
-		lastButtonState = buttonState;
-		digitalWrite(ledPin, ledState);
-		Serial.print("Led state = ");
-		Serial.println(ledState);
-	}
+    bool current = debounce(buttonPin);
 
-	x++;
-	delay(10000);
+    if (current != previous) {
+        ledState = !ledState;
+        digitalWrite(LED_BUILTIN, ledState);
+        Serial.print("Led State: ");
+        Serial.println(ledState);
+    }
+
+    x++;
+
+    previous = current;
+
+    Serial.print("Led State: ");
+    Serial.println(ledState);
+
+    delay(1000);
 }
